@@ -1,0 +1,69 @@
+---
+- hosts: idm_servers
+  become: yes
+  vars:
+    admin_pw: !vault |
+    dm_pw: !vault |
+    idm_domain: sub.example.com
+    ad_admin: rwilliams
+    ad_pw: !vault |
+    ad_domain: example.com
+    ad_realm: EXAMPLE.COM
+  tasks:
+    - name: Install required packages
+      yum:
+        name:
+          - ipa-server-trust-ad
+          - samba-client
+        state: latest
+
+    - name: Configure trust
+      shell: ipa-adtrust-install --add-sids --enable-compat -A admin -a "{{ admin_pw }}" -U
+    
+#   - name: Verify DNS records
+   
+    - name: Start and enable samba
+      service:
+        name: smb
+        state: started
+        enabled: yes
+
+    - name: Establish trust
+      shell: echo "{{ ad_pw }}" | ipa trust-add --type=ad "{{ ad_domain}}" --admin "{{ ad_admin }}" --password
+      when: inventory_hostname == 'idmsvr0001.sub.example.com'
+
+    - name: Add second trust controller
+      shell: echo "{{ ad_pw }}" | ipa trust-add --type=ad "{{ ad_domain}}" --admin "{{ ad_admin }}" --password
+      when: inventory_hostname == 'idmsvr0002.sub.example.com'
+
+    - name: Verify trust is working
+      when: inventory_hostname == 'idmsvr0001.sub.example.com'
+      shell: ldapsearch -x -b "cn=users,cn=compat,dc=sub,dc=example.com" -D "cn=Directory Manager" -w "{{ dm_pw }}" "uid={{ ad_admin }}@{{ad_domain}}"
+
+    - name: Configure default shell in sssd.conf
+      lineinfile:
+        path: /etc/sssd/sssd.conf
+        regexp: '^default_shell*'
+        insertbefore: '^\[sssd\]'
+        line: 'default_shell = /bin/bash'
+      
+    - name: Create external group
+      when: inventory_hostname == 'idmsvr0001.sub.example.com'
+      shell: ipa group-add --desc='AD users external map' ad_users_external --external
+
+    - name: Map external group
+      when: inventory_hostname == 'idmsvr0001.sub.example.com'
+      shell: ipa group-add-member ad_users_external --external '{{ ad_domain }}\Domain Users'  --users='' --groups=''
+
+    - name: Create POSIX group
+      when: inventory_hostname == 'idmsvr0001.sub.example.com'
+      shell: ipa group-add --desc='AD users' ad_users
+
+    - name: Link exteranl group to POSIX group
+      when: inventory_hostname == 'idmsvr0001.sub.example.com'
+      shell: ipa group-add-member ad_users --groups ad_users_external --users=''
+
+    - name: Allow auth without domain (setup domain resolution order)
+      when: inventory_hostname == 'idmsvr0001.sub.example.com'
+      shell: ipa config-mod --domain-resolution-order='{{ ad_domain }}:{{ idm_domain }}'
+

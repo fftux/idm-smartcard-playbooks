@@ -1,0 +1,61 @@
+- hosts: satellite
+  vars:
+    admin_pw: !vault |
+  tasks:
+    - name: install ipa-client
+      yum:
+        name: ipa-client
+        state: present
+
+    - name: enrole client
+      shell: ipa-client-install -p admin -w "{{ admin_pw }}" -U
+
+#    - name: kinit admin
+#      shell: "echo {{ admin_pw }} | kinit admin"
+
+    - name: create groups for satellite admins
+      shell: "echo {{ admin_pw }} | kinit admin; ipa group-add sat-admins"
+
+    - name: add kerberos service for satellite
+      shell: "echo {{ admin_pw }} | kinit admin; ipa service-add HTTP/$(hostname)"
+
+    - name: add hbac service
+      shell: "echo {{ admin_pw }} | kinit admin; ipa hbacsvc-add satellite"
+
+    - name: add hbac rule
+      shell: "echo {{ admin_pw }} | kinit admin; ipa hbacrule-add allow_satellite"
+
+    - name: add hbac service to rule
+      shell: "echo {{ admin_pw }} | kinit admin; ipa hbacrule-add-service allow_satellite --hbacsvcs=satellite"
+
+    - name: add user group to rule
+      shell: "echo {{ admin_pw }} | kinit admin; ipa hbacrule-add-user allow_satellite --groups=sat_admins"
+
+    - name: add satellite host to rule
+      shell: "echo {{ admin_pw }} | kinit admin; ipa hbacrule-add-host allow_satellite --hosts=$(hostname)"
+
+    - name: configure ipa auth
+      shell: satellite-installer --foreman-ipa-authentication=true --foreman-pam-service=satellite
+
+    - name: restart satellite services
+      shell: katello-service restart
+
+    - name: configure sssd to use short usernames
+      lineinfile:
+        regexp: '^full_name_format*'
+        insertafter: '^\[sssd\]'
+        line: 'full_name_format = %1$s'
+        path: /etc/sssd/sssd.conf
+
+    - name: restart sssd
+      systemd:
+        name: sssd
+        state: restarted
+
+    - name: create group for satellite admins on satellite
+      shell: hammer user-group create --admin true --name sat_admins
+
+    - name: map external group
+      #shell: hammer user-group external create --user-group sat_admins --name sat_admins --auth-source-id 4
+      debug:
+        msg: Create the external reference for the user group in the UI.  The command on this step failed, not sure what the correct auth-source-id should be.  Per the API it appears that 4 is correct.

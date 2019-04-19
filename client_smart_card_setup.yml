@@ -1,0 +1,154 @@
+---
+- hosts: clients
+  become: yes
+  vars:
+    cert_dir: "~roy.g.williams/Downloads/certs"
+    admin_pw: changeme
+    ocsp_proxy:
+    ocsp_cert_nick: 
+  tasks:
+    - name: remove pam_pkcs11
+      yum: 
+        name: pam_pkcs11
+        state: removed
+
+    - name: install packages
+      yum:
+        name:
+          - opensc
+          - dconf
+          - krb5-pkinit-openssl
+        state: latest
+
+    - name: start and enable services
+      service: 
+        name: pcscd
+        state: started
+        enabled: yes
+
+    - name: ensure OpenSC PKCS#11 module is configured
+      shell: modutil -dbdir /etc/pki/nssdb -list | grep -q OpenSC
+      register: result
+      ignore_errors: true
+
+    - name: configure OpenSC PKCS#11 module
+      shell: echo "" | modutil -dbdir /etc/pki/nssdb -add "OpenSC" -libfile /usr/lib64/opensc-pkcs11.so
+      when: result.rc == 1
+
+    - name: install DoD Root CAs
+      vars:
+        alias: "{{ item.split('.')[-2].split('/')[-1] }}"
+      shell: certutil -d /etc/pki/nssdb -A -i "{{ item }}" -n "{{ alias }}" -t CT,C,C
+      with_fileglob:
+        - "{{ cert_dir }}/DoD_Root*Root*.cer"
+        - "{{ cert_dir }}/*Root*ID*.cer"
+        - "{{ cert_dir }}/*Root*DOD_SW*.cer"
+        - "{{ cert_dir }}/*Root*EMAIL*.cer"
+        - "{{ cert_dir }}/*Interoperability*.cer"
+
+    - name: kinit admin
+      shell: "echo {{ admin_pw }} | kinit admin"
+
+    - name: update IPA CA cert database
+      command: /usr/sbin/ipa-certupdate
+
+    - name: enable smart card auth
+      # lock when card is removed
+      #command: authconfig --enablesssd --enablesssdauth --enablesmartcard --smartcardmodule=sssd --smartcardaction=0 --updateall
+      # allow card to be removed without locking 
+      command: authconfig --enablesssd --enablesssdauth --enablesmartcard --smartcardmodule=sssd --smartcardaction=1 --updateall
+
+    - name: modify krb5_auth_timeout
+      lineinfile:
+        regexp: '^krb5_auth_timeout*'
+        insertafter: '^\[domain/sub.example.com\]'
+        line: 'krb5_auth_timeout = 60'
+        path: /etc/sssd/sssd.conf
+
+    - name: modify p11_child_timeout
+      lineinfile:
+        regexp: '^p11_child_timeout*'
+        insertafter: '^\[pam\]'
+        line: 'p11_child_timeout = 60'
+        path: /etc/sssd/sssd.conf
+
+    - name: configure ocsp
+      lineinfile:
+        regexp: '^certificate_verification*'
+        insertafter: '^\[sssd\]'
+        line: 'certificate_verification = no_ocsp'
+        #line: 'certificate_verification = iocsp_default_responder={{ ocsp_proxy }},ocsp_default_responder_signing_cert={{ ocsp_cert_nick }}'
+        path: /etc/sssd/sssd.conf
+
+    - name: configure sssd to use short usernames
+      lineinfile:
+        regexp: '^full_name_format*'
+        insertafter: '^\[sssd\]'
+        line: 'full_name_format = %1$s'
+        path: /etc/sssd/sssd.conf
+
+    - name: restart sssd
+      systemd:
+        name: sssd
+        state: restarted
+
+    - name: configure alias for pkinit
+      lineinfile:
+        regexp: '^alias pkinit*'
+        line: alias pkinit="kinit -X X509_user_identity='PKCS11:opensc-pkcs11.so'"
+        path: /etc/bashrc
+
+    - name: ensure dns_lookup_realm is true 
+      lineinfile:
+        regexp: 'dns_lookup_realm.*'
+        line: '  dns_lookup_realm = true'
+        path: /etc/krb5.conf
+
+    - name: ensure dns_lookup_kdc is true 
+      lineinfile:
+        regexp: 'dns_lookup_kdc.*'
+        line: '  dns_lookup_kdc = true'
+        path: /etc/krb5.conf
+
+    - name: ensure eku checking is disabled
+      lineinfile:
+        regexp: 'pkinit_eku_checking = none'
+        line: '  pkinit_eku_checking = none'
+        insertbefore: 'realms' 
+        path: /etc/krb5.conf
+
+    - name: ensure kdc is added - adsvr0001
+      lineinfile:
+        regexp: 'pkinit_kdc_hostname = adsvr0001.example.com'
+        line: '  pkinit_kdc_hostname = adsvr0001.example.com'
+        insertbefore: 'realms' 
+        path: /etc/krb5.conf
+
+    - name: ensure kdc is added - adsvr0002
+      lineinfile:
+        regexp: 'pkinit_kdc_hostname = adsvr0002.example.com'
+        line: '  pkinit_kdc_hostname = adsvr0002.example.com'
+        insertbefore: 'realms' 
+        path: /etc/krb5.conf
+
+    - name: ensure kdc is added - adsvr0003
+      lineinfile:
+        regexp: 'pkinit_kdc_hostname = adsvr0003.example.com'
+        line: '  pkinit_kdc_hostname = adsvr0003.example.com'
+        insertbefore: 'realms' 
+        path: /etc/krb5.conf
+
+    - name: ensure pkinit_anchor is added with kdc certs
+      lineinfile:
+        regexp: 'pkinit_anchors = DIR:/var/lib/ipa-client/pki/'
+        line: '  pkinit_anchors = DIR:/var/lib/ipa-client/pki/'
+        insertbefore: 'realms' 
+        path: /etc/krb5.conf
+
+    - name: copy AD certs
+      copy:
+        src: /var/lib/ipa-client/pki/ad_certs.pem
+        dest: /var/lib/ipa-client/pki/ad_certs.pem
+        owner: root
+        group: root
+        mode: 0644

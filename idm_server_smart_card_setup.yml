@@ -1,0 +1,94 @@
+---
+- hosts: idm_servers
+  become: yes
+  vars:
+    cert_dir: /tmp/certs
+    admin_pw: !vault |
+    idm_domain: sub.example.com
+    ad_domain: example.com
+  tasks:
+    - name: kinit admin
+      shell: "echo {{ admin_pw }} | kinit admin"
+
+ #   - name: copy certs over
+ #     copy:
+ #       src: /tmp/certs
+ #       dest: /tmp
+
+    - name: Add root CAs
+      when: inventory_hostname == 'idmsvr0001.sub.example.com'
+      vars:
+        alias: "{{ item.split('.')[-2].split('/')[-1] }}"
+      shell: "ipa-cacert-manage -n {{ alias }} -t CT,C,C install {{ item }}"
+      with_fileglob:
+        - "{{ cert_dir }}/DoD_Root*Root*.cer"
+        - "{{ cert_dir }}/*Root*ID*.cer"
+        - "{{ cert_dir }}/*Root*DOD_SW*.cer"
+        - "{{ cert_dir }}/*Root*EMAIL*.cer"
+        #- "{{ cert_dir }}/*Interoperability*.cer"
+      ignore_errors: true
+    
+    - name: update IPA CA cert database
+      shell: ipa-certupdate
+
+    - name: restart httpd
+      service:
+        name: httpd
+        state: restarted
+
+    - name: check to see if map rules have been setup
+      when: inventory_hostname == 'idmsvr0001.sub.example.com'
+      shell: 'ipa certmaprule-find | grep "Rule name:" | cut -d: -f2'
+      register: maprules
+
+    - name: Configure map rule all users
+      shell: |
+        ipa certmaprule-add dod_certs_for_all_users \
+        --maprule='(|(userPrincipal={subject_nt_principal})(samAccountName={subject_nt_principal.short_name})(userCertificate;binary={cert!bin})(ipacertmapdata=X509:<I>{issuer_dn!nss_x500}<S>{subject_dn!nss_x500}))' \
+        --matchrule='<SAN:ntPrincipalName>.*@mil<ISSUER>CN=DOD.*,OU=PKI,OU=DoD,O=U.S. Government,C=US' \
+        --domain={{ ad_domain }} --domain={{ idm_domain }}
+      when: 
+        - inventory_hostname == 'idmsvr0001.sub.example.com'
+        - maprules.stdout.find('dod_certs_for_ad_users') == -1
+
+#    - name: Configure map rule for AD users
+#      shell: |
+#        ipa certmaprule-add dod_certs_for_ad_users \
+#        --maprule='(userPrincipalName={subject_nt_principal})' \
+#        --matchrule='<SAN:ntPrincipalName>.*@mil<ISSUER>CN=DOD EMAIL CA-.*,OU=PKI,OU=DoD,O=U.S. Government,C=US' \
+#        --domain={{ ad_domain }}
+#      when: 
+#        - inventory_hostname == 'idmsvr0001.sub.example.com'
+#        - maprules.stdout.find('dod_certs_for_ad_users') == -1
+#
+#    - name: Configure map rule for IdM users
+#      shell: |
+#        ipa certmaprule-add dod_certs_for_idm_users \
+#        --maprule='(ipacertmapdata=X509:<I>{issuer_dn!nss_x500}<S>{subject_dn!nss_x500})' \
+#        --matchrule='<ISSUER>CN=DOD ID CA-.*,OU=PKI,OU=DoD,O=U.S. Government,C=US' \
+#        --domain={{ idm_domain }}
+#      when: 
+#        - inventory_hostname == 'idmsvr0001.sub.example.com'
+#        - maprules.stdout.find('dod_certs_for_idm_users') == -1
+
+    - name: modify krb5_auth_timeout
+      lineinfile:
+        regexp: '^krb5_auth_timeout*'
+        insertafter: '^\[domain/sub.example.com\]'
+        line: 'krb5_auth_timeout = 60'
+        path: /etc/sssd/sssd.conf
+
+    - name: modify p11_child_timeout
+      lineinfile:
+        regexp: '^p11_child_timeout*'
+        insertafter: '^\[pam\]'
+        line: 'p11_child_timeout = 60'
+        path: /etc/sssd/sssd.conf
+
+    - name: configure ocsp
+      lineinfile:
+        regexp: '^certificate_verification*'
+        insertafter: '^\[sssd\]'
+        line: 'certificate_verification = no_ocsp'
+        #line: 'certificate_verification = iocsp_default_responder={{ ocsp_proxy }},ocsp_default_responder_signing_cert={{ ocsp_cert_nick }}'
+        path: /etc/sssd/sssd.conf
